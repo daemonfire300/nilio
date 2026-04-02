@@ -20,8 +20,15 @@ package cmd
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"io"
+	"math/big"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"reflect"
 	"slices"
@@ -29,6 +36,7 @@ import (
 	"testing"
 	"time"
 
+	jwtgo "github.com/golang-jwt/jwt/v4"
 	"github.com/klauspost/compress/zip"
 	"github.com/minio/madmin-go/v3"
 	"github.com/minio/minio-go/v7"
@@ -36,6 +44,59 @@ import (
 	"github.com/minio/minio-go/v7/pkg/set"
 	"github.com/minio/pkg/v3/ldap"
 )
+
+func initRegressionOpenIDProvider(t *testing.T, kid string, publicKey *rsa.PublicKey) *httptest.Server {
+	t.Helper()
+
+	enc := base64.RawURLEncoding
+	e := big.NewInt(int64(publicKey.E))
+	jwks := fmt.Sprintf(`{"keys":[{"kty":"RSA","kid":%q,"n":%q,"e":%q}]}`,
+		kid,
+		enc.EncodeToString(publicKey.N.Bytes()),
+		enc.EncodeToString(e.Bytes()),
+	)
+
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/.well-known/openid-configuration":
+			doc := map[string]any{
+				"issuer":                                server.URL,
+				"authorization_endpoint":                server.URL + "/authorize",
+				"token_endpoint":                        server.URL + "/token",
+				"jwks_uri":                              server.URL + "/jwks.json",
+				"response_types_supported":              []string{"code"},
+				"id_token_signing_alg_values_supported": []string{"RS256"},
+				"scopes_supported":                      []string{"openid", "groups"},
+			}
+			w.Header().Set("Content-Type", "application/json")
+			if err := json.NewEncoder(w).Encode(doc); err != nil {
+				t.Fatalf("encode discovery doc: %v", err)
+			}
+		case "/jwks.json":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(jwks))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+
+	return server
+}
+
+func signRegressionOpenIDToken(t *testing.T, privateKey *rsa.PrivateKey, kid string, claims jwtgo.MapClaims) string {
+	t.Helper()
+
+	token := jwtgo.NewWithClaims(jwtgo.SigningMethodRS256, claims)
+	token.Header["kid"] = kid
+
+	tokenString, err := token.SignedString(privateKey)
+	if err != nil {
+		t.Fatalf("sign oidc token: %v", err)
+	}
+
+	return tokenString
+}
 
 func runAllIAMSTSTests(suite *TestSuiteIAM, c *check) {
 	suite.SetUpSuite(c)
@@ -81,6 +142,162 @@ func TestIAMInternalIDPSTSServerSuite(t *testing.T) {
 				runAllIAMSTSTests(testCase, &check{t, testCase.serverType})
 			},
 		)
+	}
+}
+
+// TestRegressionOpenIDSTSClockSkewLoginAndBackendCall is the closest
+// non-browser regression to the real Console login flow. It intentionally
+// skips only the browser redirect and authorization-code exchange, and starts
+// at the same point where Console already has an id_token and begins the STS
+// exchange. The final MinIO API call models the backend/UI symptom: if MinIO
+// rejects the token here, login completion or the first backend calls fail
+// because Console never gets usable STS credentials. This uses a single
+// representative IAM suite because the clock-skew behavior is topology
+// independent and the lower-level regression tests already cover the parser
+// semantics directly.
+func TestRegressionOpenIDSTSClockSkewLoginAndBackendCall(t *testing.T) {
+	suite := iamTestSuites[0]
+	c := &check{t, suite.serverType}
+
+	suite.SetUpSuite(c)
+	suite.testRegressionOpenIDSTSClockSkewLoginAndBackendCall(c)
+	suite.TearDownSuite(c)
+}
+
+func (s *TestSuiteIAM) testRegressionOpenIDSTSClockSkewLoginAndBackendCall(c *check) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	clientID := "minio-regression-client-app"
+	clientSecret := "minio-regression-client-secret"
+	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		c.Fatalf("generate rsa key: %v", err)
+	}
+
+	provider := initRegressionOpenIDProvider(c.T, clientID, &privateKey.PublicKey)
+	defer provider.Close()
+
+	configCmds := []string{
+		"identity_openid",
+		fmt.Sprintf("config_url=%s/.well-known/openid-configuration", provider.URL),
+		fmt.Sprintf("client_id=%s", clientID),
+		fmt.Sprintf("client_secret=%s", clientSecret),
+		"claim_name=groups",
+		"scopes=openid,groups",
+		"redirect_uri=http://127.0.0.1:10000/oauth_callback",
+	}
+	_, err = s.adm.SetConfigKV(ctx, strings.Join(configCmds, " "))
+	if err != nil {
+		c.Fatalf("unable to setup fake OpenID provider for regression test: %v", err)
+	}
+
+	s.RestartIAMSuite(c)
+
+	bucket := getRandomBucketName()
+	if err = s.client.MakeBucket(ctx, bucket, minio.MakeBucketOptions{}); err != nil {
+		c.Fatalf("bucket create error: %v", err)
+	}
+
+	policyName := "projecta"
+	policyBytes := fmt.Appendf(nil, `{
+ "Version": "2012-10-17",
+ "Statement": [
+  {
+   "Effect": "Allow",
+   "Action": [
+    "s3:*"
+   ],
+   "Resource": [
+    "arn:aws:s3:::%s",
+    "arn:aws:s3:::%s/*"
+   ]
+  },
+  {
+   "Effect": "Deny",
+   "Action": [
+    "s3:DeleteObject"
+   ],
+   "Resource": [
+    "arn:aws:s3:::%s/*"
+   ]
+  }
+ ]
+}`, bucket, bucket, bucket)
+	if err = s.adm.AddCannedPolicy(ctx, policyName, policyBytes); err != nil {
+		c.Fatalf("policy add error: %v", err)
+	}
+
+	now := time.Now().UTC()
+	token := signRegressionOpenIDToken(c.T, privateKey, clientID, jwtgo.MapClaims{
+		"iss":    provider.URL,
+		"sub":    "regression-user",
+		"aud":    clientID,
+		"groups": []string{policyName},
+		"exp":    now.Add(10 * time.Minute).Unix(),
+		"iat":    now.Add(2 * time.Minute).Unix(),
+	})
+
+	webID := cr.STSWebIdentity{
+		Client:      s.TestSuiteCommon.client,
+		STSEndpoint: s.endPoint,
+		GetWebIDTokenExpiry: func() (*cr.WebIdentityToken, error) {
+			return &cr.WebIdentityToken{
+				Token: token,
+			}, nil
+		},
+	}
+
+	// Console backend requests depend on successful STS credential issuance from
+	// AssumeRoleWithWebIdentity. If MinIO rejects the returned id_token due to
+	// skew here, the failure can surface either during login completion or in the
+	// first backend API calls that need these credentials.
+	value, err := webID.Retrieve()
+	if err != nil {
+		c.Fatalf("Expected to generate STS creds from a skew-tolerated token, got err: %#v", err)
+	}
+
+	user, ok := globalIAMSys.GetUser(ctx, value.AccessKeyID)
+	if !ok {
+		c.Fatalf("expected temporary credential %s to be persisted", value.AccessKeyID)
+	}
+	policies, err := globalIAMSys.PolicyDBGet(user.Credentials.ParentUser)
+	if err != nil {
+		c.Fatalf("expected STS parent policy mapping lookup to succeed: %v", err)
+	}
+	if !slices.Contains(policies, policyName) {
+		c.Fatalf("expected STS parent policy mapping to contain %s, got %#v", policyName, policies)
+	}
+
+	secret, err := getTokenSigningKey()
+	if err != nil {
+		c.Fatalf("Error getting token signing key: %v", err)
+	}
+	sessionClaims, err := getClaimsFromTokenWithSecret(value.SessionToken, secret)
+	if err != nil {
+		c.Fatalf("expected MinIO STS session token to be immediately valid after skew-tolerant login, got err: %v", err)
+	}
+	if _, ok := sessionClaims.MapClaims[iatClaim]; ok {
+		c.Fatalf("expected MinIO STS session token to drop upstream %s claim, got %#v", iatClaim, sessionClaims.MapClaims[iatClaim])
+	}
+	if _, ok := sessionClaims.MapClaims[nbfClaim]; ok {
+		c.Fatalf("expected MinIO STS session token to drop upstream %s claim, got %#v", nbfClaim, sessionClaims.MapClaims[nbfClaim])
+	}
+
+	minioClient, err := minio.New(s.endpoint, &minio.Options{
+		Creds:     cr.NewStaticV4(value.AccessKeyID, value.SecretAccessKey, value.SessionToken),
+		Secure:    s.secure,
+		Transport: s.TestSuiteCommon.client.Transport,
+	})
+	if err != nil {
+		c.Fatalf("Error initializing client: %v", err)
+	}
+
+	c.mustListObjects(ctx, minioClient, bucket)
+
+	err = minioClient.RemoveObject(ctx, bucket, "someobject", minio.RemoveObjectOptions{})
+	if err.Error() != "Access Denied." {
+		c.Fatalf("unexpected non-access-denied err: %v", err)
 	}
 }
 
