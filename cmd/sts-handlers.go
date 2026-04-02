@@ -69,6 +69,8 @@ const (
 
 	// JWT claim keys
 	expClaim = "exp"
+	iatClaim = "iat"
+	nbfClaim = "nbf"
 	subClaim = "sub"
 	audClaim = "aud"
 	issClaim = "iss"
@@ -130,6 +132,15 @@ func (c stsClaims) populateSessionPolicy(form url.Values) error {
 
 	c[policy.SessionPolicyName] = base64.StdEncoding.EncodeToString(policyBuf)
 	return nil
+}
+
+// normalizeSSOTokenClaimsForSession drops upstream temporal claims that should
+// not be re-evaluated against MinIO's own STS session token. The upstream OIDC
+// token has already been validated, including any skew tolerance, before MinIO
+// mints its own session token.
+func (c stsClaims) normalizeSSOTokenClaimsForSession() {
+	delete(c, iatClaim)
+	delete(c, nbfClaim)
 }
 
 // stsAPIHandlers implements and provides http handlers for AWS STS API.
@@ -502,6 +513,7 @@ func (sts *stsAPIHandlers) AssumeRoleWithSSO(w http.ResponseWriter, r *http.Requ
 		writeSTSErrorResponse(ctx, w, ErrSTSInvalidParameterValue, err)
 		return
 	}
+	claims.normalizeSSOTokenClaimsForSession()
 
 	secret, err := getTokenSigningKey()
 	if err != nil {

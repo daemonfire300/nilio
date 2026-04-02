@@ -19,13 +19,18 @@ package openid
 
 import (
 	"bytes"
+	"crypto/rand"
+	"crypto/rsa"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"math/big"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -36,6 +41,270 @@ import (
 	jwtm "github.com/minio/minio/internal/jwt"
 	xnet "github.com/minio/pkg/v3/net"
 )
+
+// newTestOpenIDConfig simulates MinIO's already-loaded OpenID provider config
+// just before Console calls MinIO STS with a provider-issued id_token.
+func newTestOpenIDConfig(t *testing.T, clientID, clientSecret string) Config {
+	t.Helper()
+
+	provider := &providerCfg{
+		ClientID:     clientID,
+		ClientSecret: clientSecret,
+	}
+
+	return Config{
+		Enabled: true,
+		pubKeys: publicKeys{
+			RWMutex: &sync.RWMutex{},
+			pkMap:   map[string]any{},
+		},
+		arnProviderCfgsMap: map[arn.ARN]*providerCfg{
+			DummyRoleARN: provider,
+		},
+		ProviderCfgs: map[string]*providerCfg{
+			"1": provider,
+		},
+		closeRespFn: func(rc io.ReadCloser) {
+			rc.Close()
+		},
+		transport: http.DefaultTransport,
+	}
+}
+
+// signV4Token stands in for the id_token the OIDC provider has already issued
+// after the browser redirect and authorization-code exchange have completed.
+func signV4Token(t *testing.T, method jwtgo.SigningMethod, key any, kid string, claims jwtgo.MapClaims) string {
+	t.Helper()
+
+	token := jwtgo.NewWithClaims(method, claims)
+	token.Header["kid"] = kid
+
+	tokenString, err := token.SignedString(key)
+	if err != nil {
+		t.Fatalf("sign token: %v", err)
+	}
+
+	return tokenString
+}
+
+// initRSAJWKSServer stands in for the provider JWKS endpoint MinIO consults
+// when it verifies the signature on the id_token received through STS.
+func initRSAJWKSServer(t *testing.T, publicKey *rsa.PublicKey, kid string) *httptest.Server {
+	t.Helper()
+
+	enc := base64.RawURLEncoding
+	e := big.NewInt(int64(publicKey.E))
+	jwks := fmt.Sprintf(`{"keys":[{"kty":"RSA","kid":%q,"n":%q,"e":%q}]}`,
+		kid,
+		enc.EncodeToString(publicKey.N.Bytes()),
+		enc.EncodeToString(e.Bytes()),
+	)
+
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(jwks))
+	}))
+}
+
+func requireValidationErrorContains(t *testing.T, err error, want string) {
+	t.Helper()
+
+	if err == nil {
+		t.Fatalf("expected error containing %q, got nil", want)
+	}
+	if !strings.Contains(strings.ToLower(err.Error()), strings.ToLower(want)) {
+		t.Fatalf("expected error containing %q, got %v", want, err)
+	}
+}
+
+// TestRegressionValidateRejectsFutureIATWithoutClockSkew documents the original
+// regression where MinIO rejected an otherwise valid OIDC id_token solely
+// because iat was slightly in the future. This models the exact server-side
+// validation step hit after Console has already finished the browser redirect
+// and posts the returned id_token to MinIO STS.
+func TestRegressionValidateRejectsFutureIATWithoutClockSkew(t *testing.T) {
+	now := time.Now().UTC()
+	clientID := "strict-iat-client"
+	clientSecret := "strict-iat-secret"
+	token := signV4Token(t, jwtgo.SigningMethodHS256, []byte(clientSecret), clientID, jwtgo.MapClaims{
+		"aud": clientID,
+		"exp": now.Add(10 * time.Minute).Unix(),
+		"iat": now.Add(2 * time.Minute).Unix(),
+	})
+
+	parser := jwtgo.NewParser(jwtgo.WithValidMethods([]string{jwtgo.SigningMethodHS256.Alg()}))
+	claims := jwtgo.MapClaims{}
+	_, err := parser.ParseWithClaims(token, &claims, func(*jwtgo.Token) (any, error) {
+		return []byte(clientSecret), nil
+	})
+	requireValidationErrorContains(t, err, "used before issued")
+}
+
+// TestRegressionValidateRejectsFutureNBFWithoutClockSkew documents the
+// pre-fix no-leeway behavior for nbf. This covers the same post-browser,
+// pre-STS-credential validation point in MinIO without needing the browser or
+// authorization-code exchange itself.
+func TestRegressionValidateRejectsFutureNBFWithoutClockSkew(t *testing.T) {
+	now := time.Now().UTC()
+	clientID := "strict-nbf-client"
+	clientSecret := "strict-nbf-secret"
+	token := signV4Token(t, jwtgo.SigningMethodHS256, []byte(clientSecret), clientID, jwtgo.MapClaims{
+		"aud": clientID,
+		"exp": now.Add(10 * time.Minute).Unix(),
+		"nbf": now.Add(2 * time.Minute).Unix(),
+	})
+
+	parser := jwtgo.NewParser(jwtgo.WithValidMethods([]string{jwtgo.SigningMethodHS256.Alg()}))
+	claims := jwtgo.MapClaims{}
+	_, err := parser.ParseWithClaims(token, &claims, func(*jwtgo.Token) (any, error) {
+		return []byte(clientSecret), nil
+	})
+	requireValidationErrorContains(t, err, "not valid yet")
+}
+
+// TestRegressionValidateAcceptsFutureIATWithinSkew verifies the clock-skew fix
+// for the exact point where Console has already exchanged the browser auth code
+// for an id_token and MinIO is validating that token in OpenIDConfig.Validate.
+// It intentionally skips only the browser redirect and code-exchange steps.
+func TestRegressionValidateAcceptsFutureIATWithinSkew(t *testing.T) {
+	now := time.Now().UTC()
+	clientID := "future-iat-client"
+	clientSecret := "future-iat-secret"
+	cfg := newTestOpenIDConfig(t, clientID, clientSecret)
+	cfg.pubKeys.add(clientID, []byte(clientSecret))
+
+	token := signV4Token(t, jwtgo.SigningMethodHS256, []byte(clientSecret), clientID, jwtgo.MapClaims{
+		"aud": clientID,
+		"exp": now.Add(10 * time.Minute).Unix(),
+		"iat": now.Add(2 * time.Minute).Unix(),
+	})
+
+	claims := map[string]any{}
+	if err := cfg.Validate(t.Context(), DummyRoleARN, token, "", "", claims); err != nil {
+		t.Fatalf("expected future iat within skew to validate, got %v", err)
+	}
+}
+
+// TestRegressionValidateAcceptsFutureNBFWithinSkew verifies that mild skew on
+// nbf is accepted at the same MinIO validation point reached immediately after
+// Console sends the provider-issued id_token to STS. It intentionally skips the
+// browser and provider code-exchange layers.
+func TestRegressionValidateAcceptsFutureNBFWithinSkew(t *testing.T) {
+	now := time.Now().UTC()
+	clientID := "future-nbf-client"
+	clientSecret := "future-nbf-secret"
+	cfg := newTestOpenIDConfig(t, clientID, clientSecret)
+	cfg.pubKeys.add(clientID, []byte(clientSecret))
+
+	token := signV4Token(t, jwtgo.SigningMethodHS256, []byte(clientSecret), clientID, jwtgo.MapClaims{
+		"aud": clientID,
+		"exp": now.Add(10 * time.Minute).Unix(),
+		"nbf": now.Add(4 * time.Minute).Unix(),
+	})
+
+	claims := map[string]any{}
+	if err := cfg.Validate(t.Context(), DummyRoleARN, token, "", "", claims); err != nil {
+		t.Fatalf("expected future nbf within skew to validate, got %v", err)
+	}
+}
+
+// TestRegressionValidateRejectsFutureNBFBeyondSkew verifies that the fix only
+// tolerates mild clock skew and still rejects materially future nbf values at
+// the same post-browser MinIO token-validation point.
+func TestRegressionValidateRejectsFutureNBFBeyondSkew(t *testing.T) {
+	now := time.Now().UTC()
+	clientID := "future-nbf-beyond-client"
+	clientSecret := "future-nbf-beyond-secret"
+	cfg := newTestOpenIDConfig(t, clientID, clientSecret)
+	cfg.pubKeys.add(clientID, []byte(clientSecret))
+
+	token := signV4Token(t, jwtgo.SigningMethodHS256, []byte(clientSecret), clientID, jwtgo.MapClaims{
+		"aud": clientID,
+		"exp": now.Add(10 * time.Minute).Unix(),
+		"nbf": now.Add(6 * time.Minute).Unix(),
+	})
+
+	claims := map[string]any{}
+	err := cfg.Validate(t.Context(), DummyRoleARN, token, "", "", claims)
+	requireValidationErrorContains(t, err, "not valid yet")
+}
+
+// TestRegressionValidateAcceptsRecentExpiryWithinSkew verifies that mild
+// negative skew on exp is tolerated when MinIO validates the id_token Console
+// has already received from the provider. It intentionally skips browser and
+// code-exchange mechanics to isolate the STS validation regression.
+func TestRegressionValidateAcceptsRecentExpiryWithinSkew(t *testing.T) {
+	now := time.Now().UTC()
+	clientID := "recent-exp-client"
+	clientSecret := "recent-exp-secret"
+	cfg := newTestOpenIDConfig(t, clientID, clientSecret)
+	cfg.pubKeys.add(clientID, []byte(clientSecret))
+
+	token := signV4Token(t, jwtgo.SigningMethodHS256, []byte(clientSecret), clientID, jwtgo.MapClaims{
+		"aud": clientID,
+		"exp": now.Add(-2 * time.Minute).Unix(),
+	})
+
+	claims := map[string]any{}
+	if err := cfg.Validate(t.Context(), DummyRoleARN, token, "", "", claims); err != nil {
+		t.Fatalf("expected recently expired token within skew to validate, got %v", err)
+	}
+}
+
+// TestRegressionValidateRejectsExpiryBeyondSkew verifies that tokens outside
+// the allowed leeway still map to ErrTokenExpired, which is the contract the
+// STS handler uses when surfacing real login failures back to Console.
+func TestRegressionValidateRejectsExpiryBeyondSkew(t *testing.T) {
+	now := time.Now().UTC()
+	clientID := "expired-client"
+	clientSecret := "expired-secret"
+	cfg := newTestOpenIDConfig(t, clientID, clientSecret)
+	cfg.pubKeys.add(clientID, []byte(clientSecret))
+
+	token := signV4Token(t, jwtgo.SigningMethodHS256, []byte(clientSecret), clientID, jwtgo.MapClaims{
+		"aud": clientID,
+		"exp": now.Add(-6 * time.Minute).Unix(),
+	})
+
+	claims := map[string]any{}
+	err := cfg.Validate(t.Context(), DummyRoleARN, token, "", "", claims)
+	if !errors.Is(err, ErrTokenExpired) {
+		t.Fatalf("expected ErrTokenExpired, got %v", err)
+	}
+}
+
+// TestRegressionValidateRetryKeepsValidMethods verifies the retry-path
+// regression where a JWKS refresh could otherwise weaken signing-method
+// validation. This still models the same MinIO-side id_token verification step
+// reached after Console has already obtained the token from the provider.
+func TestRegressionValidateRetryKeepsValidMethods(t *testing.T) {
+	now := time.Now().UTC()
+	clientID := "retry-valid-methods-client"
+	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("generate rsa key: %v", err)
+	}
+
+	jwksServer := initRSAJWKSServer(t, &privateKey.PublicKey, clientID)
+	defer jwksServer.Close()
+
+	cfg := newTestOpenIDConfig(t, clientID, "unused-secret")
+	jwksURL, err := xnet.ParseHTTPURL(jwksServer.URL)
+	if err != nil {
+		t.Fatalf("parse jwks url: %v", err)
+	}
+	cfg.arnProviderCfgsMap[DummyRoleARN].JWKS.URL = jwksURL
+	cfg.ProviderCfgs["1"].JWKS.URL = jwksURL
+
+	token := signV4Token(t, jwtgo.SigningMethodPS256, privateKey, clientID, jwtgo.MapClaims{
+		"aud": clientID,
+		"exp": now.Add(10 * time.Minute).Unix(),
+	})
+
+	claims := map[string]any{}
+	err = cfg.Validate(t.Context(), DummyRoleARN, token, "", "", claims)
+	requireValidationErrorContains(t, err, "signing method")
+}
 
 func TestUpdateClaimsExpiry(t *testing.T) {
 	testCases := []struct {
@@ -145,7 +414,7 @@ func TestJWTHMACType(t *testing.T) {
 		},
 	}
 
-	var claims jwtgo.MapClaims
+	claims := jwtgo.MapClaims{}
 	if err = cfg.Validate(t.Context(), DummyRoleARN, token, "", "", claims); err != nil {
 		t.Fatal(err)
 	}
@@ -197,7 +466,7 @@ func TestJWT(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	var claims jwtgo.MapClaims
+	claims := jwtgo.MapClaims{}
 	if err = cfg.Validate(t.Context(), DummyRoleARN, u.Query().Get("Token"), "", "", claims); err == nil {
 		t.Fatal(err)
 	}
