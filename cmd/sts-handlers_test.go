@@ -277,11 +277,11 @@ func (s *TestSuiteIAM) testRegressionOpenIDSTSClockSkewLoginAndBackendCall(c *ch
 	if err != nil {
 		c.Fatalf("expected MinIO STS session token to be immediately valid after skew-tolerant login, got err: %v", err)
 	}
-	if _, ok := sessionClaims.MapClaims[iatClaim]; ok {
-		c.Fatalf("expected MinIO STS session token to drop upstream %s claim, got %#v", iatClaim, sessionClaims.MapClaims[iatClaim])
+	if _, ok := sessionClaims.MapClaims["iat"]; ok {
+		c.Fatalf("expected MinIO STS session token to drop upstream iat claim, got %#v", sessionClaims.MapClaims["iat"])
 	}
-	if _, ok := sessionClaims.MapClaims[nbfClaim]; ok {
-		c.Fatalf("expected MinIO STS session token to drop upstream %s claim, got %#v", nbfClaim, sessionClaims.MapClaims[nbfClaim])
+	if _, ok := sessionClaims.MapClaims["nbf"]; ok {
+		c.Fatalf("expected MinIO STS session token to drop upstream nbf claim, got %#v", sessionClaims.MapClaims["nbf"])
 	}
 
 	minioClient, err := minio.New(s.endpoint, &minio.Options{
