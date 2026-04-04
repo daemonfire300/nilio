@@ -27,7 +27,7 @@ import (
 	"sync"
 	"time"
 
-	jwtgo "github.com/golang-jwt/jwt/v4"
+	jwtgo "github.com/golang-jwt/jwt/v5"
 	"github.com/minio/minio/internal/arn"
 	"github.com/minio/minio/internal/auth"
 	xnet "github.com/minio/pkg/v3/net"
@@ -128,20 +128,25 @@ func updateClaimsExpiry(dsecs string, claims map[string]any) error {
 }
 
 const (
-	audClaim = "aud"
-	azpClaim = "azp"
+	audClaim           = "aud"
+	azpClaim           = "azp"
+	openidJWTClockSkew = 5 * time.Minute
 )
+
+var openidJWTValidMethods = []string{
+	"RS256", "RS384", "RS512",
+	"ES256", "ES384", "ES512",
+	"HS256", "HS384", "HS512",
+	"RS3256", "RS3384", "RS3512",
+	"ES3256", "ES3384", "ES3512",
+}
 
 // Validate - validates the id_token.
 func (r *Config) Validate(ctx context.Context, arn arn.ARN, token, accessToken, dsecs string, claims map[string]any) error {
-	jp := new(jwtgo.Parser)
-	jp.ValidMethods = []string{
-		"RS256", "RS384", "RS512",
-		"ES256", "ES384", "ES512",
-		"HS256", "HS384", "HS512",
-		"RS3256", "RS3384", "RS3512",
-		"ES3256", "ES3384", "ES3512",
-	}
+	parser := jwtgo.NewParser(
+		jwtgo.WithValidMethods(openidJWTValidMethods),
+		jwtgo.WithLeeway(openidJWTClockSkew),
+	)
 
 	keyFuncCallback := func(jwtToken *jwtgo.Token) (any, error) {
 		kid, ok := jwtToken.Header["kid"].(string)
@@ -161,21 +166,28 @@ func (r *Config) Validate(ctx context.Context, arn arn.ARN, token, accessToken, 
 	}
 
 	mclaims := jwtgo.MapClaims(claims)
-	jwtToken, err := jp.ParseWithClaims(token, &mclaims, keyFuncCallback)
+	parseWithConfiguredParser := func() error {
+		_, err := parser.ParseWithClaims(token, mclaims, keyFuncCallback)
+		if err != nil {
+			if errors.Is(err, jwtgo.ErrTokenExpired) {
+				return ErrTokenExpired
+			}
+			return err
+		}
+		return nil
+	}
+
+	err := parseWithConfiguredParser()
 	if err != nil {
 		// Re-populate the public key in-case the JWKS
 		// pubkeys are refreshed
 		if err = r.PopulatePublicKey(arn); err != nil {
 			return err
 		}
-		jwtToken, err = jwtgo.ParseWithClaims(token, &mclaims, keyFuncCallback)
+		err = parseWithConfiguredParser()
 		if err != nil {
 			return err
 		}
-	}
-
-	if !jwtToken.Valid {
-		return ErrTokenExpired
 	}
 
 	if err = updateClaimsExpiry(dsecs, mclaims); err != nil {
